@@ -5,6 +5,7 @@ from datetime import date, datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
 from services.analyzer import analyze
 from services.kbo_schedule import fetch_kbo_schedule
@@ -20,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Locations to pre-fetch on schedule
-POPULAR_LOCATIONS = ["잠실", "고척"]
+POPULAR_LOCATIONS = ["잠실", "고척", "문학", "수원", "사직", "대전", "대구", "광주", "창원"]
 
 scheduler = AsyncIOScheduler()
 
@@ -45,8 +46,12 @@ async def prefetch_game_schedule():
             "total_games": len(games),
             "games": games,
         }
-        cache.set("games:today", result)
-        logger.info("Pre-fetched KBO schedule: %d games", len(games))
+        live = any(g.get("status") == "경기 중" for g in games)
+        interval = 1 if live else 10
+        ttl = 70 if live else 600
+        cache.set("games:today", result, ttl=ttl)
+        scheduler.reschedule_job("game_schedule", trigger="interval", minutes=interval)
+        logger.info("Pre-fetched KBO schedule: %d games, next poll in %dmin (ttl=%ds)", len(games), interval, ttl)
     except Exception as e:
         logger.error("Failed to pre-fetch KBO schedule: %s", e)
 
@@ -55,7 +60,7 @@ async def prefetch_game_schedule():
 async def lifespan(app: FastAPI):
     # Startup
     scheduler.add_job(prefetch_popular_locations, "interval", minutes=5)
-    scheduler.add_job(prefetch_game_schedule, "interval", minutes=10)
+    scheduler.add_job(prefetch_game_schedule, "interval", minutes=10, id="game_schedule")
     scheduler.start()
     logger.info("Scheduler started: parking every 5min, games every 10min")
     # Run initial pre-fetch
@@ -72,6 +77,13 @@ app = FastAPI(
     description="야구장 주변 주차 혼잡도 분석 API",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 

@@ -2,7 +2,21 @@
   "permissions": {
     "allow": [
       "Bash(pip install:*)",
-      "Bash(python -m pytest tests/ -v)"
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(grep -E '\\\\.\\(py|txt|md\\)$')",
+      "Bash(grep -rn \"^\\\\s*pass\\\\s*$\" /c/Users/admin/AndroidStudioProjects/apiserver --include=\"*.py\")",
+      "Bash(wc -l /c/Users/admin/AndroidStudioProjects/apiserver/**/*.py)",
+      "Bash(curl -s http://localhost:8000/health)",
+      "Bash(curl -s \"http://localhost:8000/games\")",
+      "Bash(python -c \"import json,sys; games=json.load\\(sys.stdin\\)['games']; [print\\(g['home_team'], g['stadium'], g['score']\\) for g in games]\")",
+      "Bash(python -c \"import json,sys; data=json.load\\(sys.stdin\\); [print\\(g['home_team'], '|', g['stadium'], '|', g['score']\\) for g in data['games']]\")",
+      "Bash(python -c \"import json,sys; data=json.load\\(sys.stdin\\); [print\\(g['home_team'], '|', g['stadium'], '|', g['status'], '|', g['score']\\) for g in data['games']]\")",
+      "Bash(python:*)",
+      "WebFetch(domain:apis.data.go.kr)",
+      "WebSearch",
+      "WebFetch(domain:www.data.go.kr)",
+      "WebFetch(domain:pis.daegu.go.kr)",
+      "Bash(dart analyze:*)"
     ]
   }
 }

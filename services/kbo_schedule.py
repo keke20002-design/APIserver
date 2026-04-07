@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import date, datetime
 
@@ -7,6 +8,12 @@ logger = logging.getLogger(__name__)
 
 NAVER_SPORTS_SCHEDULE_URL = (
     "https://api-gw.sports.naver.com/schedule/games"
+)
+NAVER_SPORTS_PREVIEW_URL = (
+    "https://api-gw.sports.naver.com/schedule/games/{game_id}/preview"
+)
+NAVER_SPORTS_RELAY_URL = (
+    "https://api-gw.sports.naver.com/schedule/games/{game_id}/relay"
 )
 
 # 구장별 티켓 예매 링크
@@ -37,6 +44,83 @@ TEAM_STADIUM = {
 }
 
 
+PITCH_TYPE_KO = {
+    "FAST": "직구",
+    "TWOS": "투심",
+    "CUTT": "커터",
+    "SLID": "슬라이더",
+    "CURV": "커브",
+    "CHUP": "체인지업",
+    "FORK": "포크",
+    "SINK": "싱커",
+    "KNUC": "너클볼",
+}
+
+
+def _parse_starter(starter: dict | None) -> dict | None:
+    """Extract relevant starter info from preview API response."""
+    if not starter:
+        return None
+    info = starter.get("playerInfo", {})
+    season_stats = starter.get("currentSeasonStatsOnOpponents", {})
+    pitch_kinds = starter.get("currentPitKindStats", [])
+
+    # 구종 정보: type + speed + 비율
+    pitches = [
+        {
+            "type": p.get("type", ""),
+            "type_ko": PITCH_TYPE_KO.get(p.get("type", ""), p.get("type", "")),
+            "speed": p.get("speed"),
+            "ratio": round(p.get("pit_rt", 0), 1),
+        }
+        for p in pitch_kinds
+        if p.get("type")
+    ]
+
+    return {
+        "name": info.get("name", ""),
+        "backnum": info.get("backnum", ""),
+        "era": season_stats.get("era"),
+        "wins": season_stats.get("w"),
+        "losses": season_stats.get("l"),
+        "pitches": pitches,
+    }
+
+
+async def _fetch_starters(client: httpx.AsyncClient, game_id: str) -> dict:
+    """Fetch home/away starters from preview API. Returns {} on failure."""
+    try:
+        url = NAVER_SPORTS_PREVIEW_URL.format(game_id=game_id)
+        response = await client.get(url, timeout=8.0)
+        response.raise_for_status()
+        data = response.json()
+        preview = data.get("result", {}).get("previewData", {})
+        return {
+            "home_starter": _parse_starter(preview.get("homeStarter")),
+            "away_starter": _parse_starter(preview.get("awayStarter")),
+        }
+    except Exception as e:
+        logger.warning("Failed to fetch starters for game %s: %s", game_id, e)
+        return {"home_starter": None, "away_starter": None}
+
+
+async def _fetch_current_pitchers(client: httpx.AsyncClient, game_id: str) -> dict:
+    """Fetch current pitchers from relay API for live games. Returns {} on failure."""
+    try:
+        url = NAVER_SPORTS_RELAY_URL.format(game_id=game_id)
+        response = await client.get(url, timeout=8.0)
+        response.raise_for_status()
+        data = response.json()
+        logger.debug("Relay API response for %s: %s", game_id, data)
+        relay = data.get("result", {}).get("relayData", {})
+        home_pitcher = relay.get("homePitcher", {}).get("name") if relay.get("homePitcher") else None
+        away_pitcher = relay.get("awayPitcher", {}).get("name") if relay.get("awayPitcher") else None
+        return {"home_current_pitcher": home_pitcher, "away_current_pitcher": away_pitcher}
+    except Exception as e:
+        logger.warning("Failed to fetch relay for game %s: %s", game_id, e)
+        return {"home_current_pitcher": None, "away_current_pitcher": None}
+
+
 async def fetch_kbo_schedule(target_date: date | None = None) -> list[dict]:
     """Fetch KBO game schedule for a given date from Naver Sports API."""
     if target_date is None:
@@ -45,17 +129,20 @@ async def fetch_kbo_schedule(target_date: date | None = None) -> list[dict]:
     date_str = target_date.strftime("%Y-%m-%d")
 
     params = {
-        "fields": "basic,superCategoryId,categoryName",
+        "fields": "basic,schedule,baseball,manualRelayUrl",
         "upperCategoryId": "kbaseball",
-        "categoryId": "kbo",
         "fromDate": date_str,
         "toDate": date_str,
-        "roundCodes": "",
         "size": "500",
     }
 
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://sports.naver.com/kbaseball/schedule/index",
+    }
+
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
             response = await client.get(
                 NAVER_SPORTS_SCHEDULE_URL, params=params
             )
@@ -65,7 +152,35 @@ async def fetch_kbo_schedule(target_date: date | None = None) -> list[dict]:
         logger.error("Failed to fetch KBO schedule: %s", e)
         raise RuntimeError(f"Failed to fetch KBO schedule: {e}")
 
-    return _parse_schedule(data, date_str)
+    games = _parse_schedule(data, date_str)
+
+    if games:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Fetch starters for all games in parallel
+            starter_tasks = [
+                _fetch_starters(client, g["game_id"])
+                for g in games
+                if g.get("game_id")
+            ]
+            starters_list = await asyncio.gather(*starter_tasks)
+
+            # Fetch current pitchers only for live games
+            live_games = [g for g in games if g.get("status") == "경기 중" and g.get("game_id")]
+            if live_games:
+                relay_tasks = [_fetch_current_pitchers(client, g["game_id"]) for g in live_games]
+                relay_list = await asyncio.gather(*relay_tasks)
+                relay_map = {g["game_id"]: r for g, r in zip(live_games, relay_list)}
+            else:
+                relay_map = {}
+
+        for game, starters in zip(games, starters_list):
+            game["home_starter"] = starters.get("home_starter")
+            game["away_starter"] = starters.get("away_starter")
+            relay = relay_map.get(game.get("game_id"), {})
+            game["home_current_pitcher"] = relay.get("home_current_pitcher")
+            game["away_current_pitcher"] = relay.get("away_current_pitcher")
+
+    return games
 
 
 def _parse_schedule(data: dict, date_str: str) -> list[dict]:
@@ -74,50 +189,74 @@ def _parse_schedule(data: dict, date_str: str) -> list[dict]:
 
     items = data.get("result", {}).get("games", [])
     if not items:
-        # Fallback: try alternative response shapes
         items = data.get("games", [])
 
     for game in items:
-        home_team = game.get("homeTeamName", "")
-        away_team = game.get("awayTeamName", "")
-        game_time = game.get("gameDateTime", "")
-        status_code = game.get("statusCode", "")
-        home_score = game.get("homeTeamScore", "")
-        away_score = game.get("awayTeamScore", "")
-        stadium = game.get("stadiumName", "")
+        game_id = game.get("gameId", "")
+        home_team = (
+            game.get("homeTeamName")
+            or game.get("homeTeam", {}).get("name", "")
+            or ""
+        )
+        away_team = (
+            game.get("awayTeamName")
+            or game.get("awayTeam", {}).get("name", "")
+            or ""
+        )
+        game_time = game.get("gameDateTime") or game.get("startTime") or ""
+        status_code = game.get("statusCode") or game.get("gameStatus") or ""
 
-        # 시간 파싱
+        home_score = (
+            game.get("homeTeamScore")
+            if game.get("homeTeamScore") is not None
+            else game.get("homeScore")
+        )
+        away_score = (
+            game.get("awayTeamScore")
+            if game.get("awayTeamScore") is not None
+            else game.get("awayScore")
+        )
+
+        stadium = game.get("stadiumName") or game.get("stadium") or ""
+
         display_time = ""
         if game_time:
             try:
-                dt = datetime.fromisoformat(game_time.replace("Z", "+00:00"))
+                dt = datetime.fromisoformat(str(game_time).replace("Z", "+00:00"))
                 display_time = dt.strftime("%H:%M")
             except (ValueError, AttributeError):
-                display_time = game_time
+                display_time = str(game_time)
 
-        # 경기 상태 결정
         game_status = _determine_game_status(status_code)
 
-        # 구장 이름으로 티켓 링크 매칭
+        if not stadium and home_team in TEAM_STADIUM:
+            stadium = TEAM_STADIUM[home_team]
+
         ticket_url = ""
         for key, url in TICKET_LINKS.items():
             if key in stadium:
                 ticket_url = url
                 break
-        # 홈팀으로 폴백
-        if not ticket_url and home_team in TEAM_STADIUM:
-            stadium_key = TEAM_STADIUM[home_team]
-            ticket_url = TICKET_LINKS.get(stadium_key, "")
+
+        score_str = None
+        if game_status in ("경기 중", "경기 종료") and home_score is not None and away_score is not None:
+            score_str = f"{away_score}:{home_score}"
 
         games.append({
+            "game_id": game_id,
             "home_team": home_team,
             "away_team": away_team,
             "stadium": stadium,
             "time": display_time,
             "status": game_status,
-            "score": f"{away_score}:{home_score}" if home_score != "" else None,
+            "score": score_str,
             "ticket_url": ticket_url,
             "date": date_str,
+            # starters and current pitchers will be filled after parallel fetch
+            "home_starter": None,
+            "away_starter": None,
+            "home_current_pitcher": None,
+            "away_current_pitcher": None,
         })
 
     logger.info("Parsed %d KBO games for %s", len(games), date_str)
@@ -128,9 +267,17 @@ def _determine_game_status(status_code: str) -> str:
     """Convert API status code to display status."""
     status_map = {
         "BEFORE": "경기 전",
+        "READY": "경기 전",
         "STARTED": "경기 중",
+        "LIVE": "경기 중",
+        "PLAYING": "경기 중",
         "RESULT": "경기 종료",
+        "AFTER": "경기 종료",
+        "FINAL": "경기 종료",
+        "END": "경기 종료",
+        "FINISH": "경기 종료",
         "CANCEL": "경기 취소",
         "POSTPONE": "경기 연기",
+        "DELAY": "경기 연기",
     }
     return status_map.get(status_code, status_code or "미정")
