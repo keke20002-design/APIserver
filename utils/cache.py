@@ -22,6 +22,13 @@ class TTLCache:
         ttl = ttl if ttl is not None else self._default_ttl
         self._store[key] = (value, time.time() + ttl)
 
+    def delete(self, key: str) -> None:
+        self._store.pop(key, None)
+
+    def delete_prefix(self, prefix: str) -> None:
+        for key in [k for k in self._store if k.startswith(prefix)]:
+            self._store.pop(key, None)
+
     def clear(self) -> None:
         self._store.clear()
 

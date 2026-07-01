@@ -12,17 +12,22 @@ logger = logging.getLogger(__name__)
 # "schedule" → 경기 일정 기반 추정 (해당 지자체 API 확보 전 임시)
 STADIUM_SOURCE = {
     "잠실": "seoul",
-    "고척": "seoul",
+    "고척": "schedule",  # TODO: 고척 인근 실시간 주차 API 미확보
     "문학": "schedule",  # TODO: 인천시 실시간 주차 API 연동 예정
     "수원": "schedule",  # TODO: 경기도 실시간 주차 API 연동 예정
     "사직": "schedule",  # TODO: 부산시 실시간 주차 API 연동 예정
-    "대전": "daejeon",
+    "대전": "schedule",  # TODO: 대전 실시간 주차 API 인증 오류로 임시 비활성화
     "대구": "schedule",  # TODO: 대구시 실시간 주차 API 연동 예정
     "광주": "schedule",  # TODO: 광주시 실시간 주차 API 연동 예정
     "창원": "schedule",  # TODO: 창원시 실시간 주차 API 연동 예정
 }
 
 QUE_STATUS_MAP = {"10": "good", "20": "normal", "30": "bad"}
+
+# 서울 API 주차장 이름 검색 키워드 매핑 (location → API 이름에 포함된 실제 키워드)
+SEOUL_PARKING_KEYWORD: dict[str, str] = {
+    "잠실": "잠실역 공영주차장",
+}
 
 STATUS_MESSAGES = {
     "good": "현재 주차 여유",
@@ -44,9 +49,9 @@ def _aggregate_status(lots: list[dict]) -> str:
         total_current = sum(l["current"] for l in lots_with_capacity)
         total_capacity = sum(l["total"] for l in lots_with_capacity)
         rate = total_current / total_capacity
-        if rate < 0.5:
+        if rate < 0.6:
             return "good"
-        elif rate < 0.8:
+        elif rate < 0.85:
             return "normal"
         else:
             return "bad"
@@ -74,9 +79,9 @@ def _aggregate_status_by_remaining(lots: list[dict]) -> str:
     total_remaining = sum(l["remaining"] for l in valid)
     availability = total_remaining / total_capacity
 
-    if availability > 0.5:
+    if availability > 0.4:
         return "good"
-    elif availability > 0.2:
+    elif availability > 0.15:
         return "normal"
     else:
         return "bad"
@@ -136,9 +141,9 @@ def _remaining_to_status(lot: dict) -> str:
     if lot["total"] == 0:
         return "unknown"
     availability = lot["remaining"] / lot["total"]
-    if availability > 0.5:
+    if availability > 0.4:
         return "good"
-    elif availability > 0.2:
+    elif availability > 0.15:
         return "normal"
     else:
         return "bad"
@@ -158,7 +163,8 @@ async def _analyze_seoul(location: str) -> dict:
             "estimated": False,
         }
 
-    filtered = [l for l in all_lots if location in l["name"]]
+    keyword = SEOUL_PARKING_KEYWORD.get(location, location)
+    filtered = [l for l in all_lots if keyword in l["name"]]
 
     if not filtered:
         logger.warning("No Seoul parking lots found for '%s'", location)

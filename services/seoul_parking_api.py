@@ -24,13 +24,12 @@ async def fetch_parking_lots() -> list[dict]:
 
     lots = []
     for row in root.findall(".//row"):
-        name = row.findtext("PKNM", "").strip()
-        que_status = row.findtext("QUE_STATUS", "").strip()
-        current = int(row.findtext("CUR_PK_CNT", "0") or 0)
-        total = int(row.findtext("TP_PK_CNT", "0") or 0)
+        name = row.findtext("PKLT_NM", "").strip()
+        current = int(row.findtext("NOW_PRK_VHCL_CNT", "0") or 0)
+        total = int(row.findtext("TPKCT", "0") or 0)
         lots.append({
             "name": name,
-            "que_status": que_status,
+            "que_status": "",
             "current": current,
             "total": total,
         })

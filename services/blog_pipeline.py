@@ -8,7 +8,7 @@ import pytz
 
 from services.blog_db import init_db, mark_keyword_used, save_post_log, get_recent_posts
 from services.blog_naver_service import collect_hot_news, pick_fallback_keyword
-from services.blog_gemini_service import generate_analytical_post, generate_blog_post, generate_english_post, generate_post_image
+from services.blog_gemini_service import generate_analytical_post, generate_blog_post, generate_english_post, generate_english_guide_post, generate_kr_guide_post, generate_post_image
 from services.blog_wordpress_service import publish_post, upload_image, edit_post
 
 logger = logging.getLogger(__name__)
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 KST = pytz.timezone("Asia/Seoul")
 
 # 하루 최대 발행 수 (한국어+영어 슬롯당 2개 × 4슬롯 = 8, 여유 2)
-MAX_POSTS_PER_DAY = 10
+MAX_POSTS_PER_DAY = 3
 
 # 시간대별 카테고리 우선순위
 SLOT_CATEGORY_HINT: dict[str, str] = {
@@ -58,17 +58,21 @@ _BLOG_CSS = """<style>
 .faq-item{margin:16px 0;}
 .faq-q{font-size:16px;font-weight:700;color:#1e3a8a;margin-bottom:6px;}
 .faq-a{color:#374151;line-height:1.8;}
+mark{background:#fef08a;color:#1a1a1a;padding:2px 5px;border-radius:3px;font-weight:600;}
+.conclusion-box mark{background:rgba(254,240,138,0.55);color:#fff;font-weight:600;}
+.entry-content a,.post-content a,a{color:#2563eb;text-decoration:none;border-bottom:1px solid #93c5fd;}
 </style>\n"""
 
 
-def _inject_summary_box(content: str, summary: list[str]) -> str:
-    """본문 최상단에 CSS + 3줄 요약 박스 삽입."""
+def _inject_summary_box(content: str, summary: list[str], lang: str = "ko") -> str:
+    """본문 최상단에 CSS + 요약 박스 삽입."""
     if not summary:
         return _BLOG_CSS + content
+    label = "📌 Key Takeaways" if lang == "en" else "📌 3줄 요약"
     items_html = "".join(f"<li>{item}</li>" for item in summary[:3])
     box = (
         '<div class="summary-box">'
-        "<h3>📌 3줄 요약</h3>"
+        f"<h3>{label}</h3>"
         f"<ul>{items_html}</ul>"
         "</div>\n"
     )
@@ -168,12 +172,9 @@ async def run_blog_pipeline(
         category = hot_issue.get("category", SLOT_CATEGORY_HINT.get(chosen_slot, "AI"))
         logger.info("News collected — query='%s', items=%d", hot_issue["query"], len(news_items))
 
-        # 2. 한국어 + 영어 콘텐츠 동시 생성
-        _ni, _sl, _cat = news_items, chosen_slot, category
-        post_data, en_post_data = await asyncio.gather(
-            _run_with_retry(lambda: generate_analytical_post(_ni, _sl)),
-            _run_with_retry(lambda: generate_english_post(_ni, _sl, _cat)),
-        )
+        # 2. 한국어 콘텐츠 생성
+        _ni, _sl = news_items, chosen_slot
+        post_data = await _run_with_retry(lambda: generate_analytical_post(_ni, _sl))
         keyword = post_data["keyword"]
 
     else:
@@ -185,10 +186,7 @@ async def run_blog_pipeline(
         from services.blog_naver_service import _detect_category as _naver_cat
         category = _naver_cat(keyword)
         _kw, _cat = keyword, category
-        post_data, en_post_data = await asyncio.gather(
-            _run_with_retry(lambda: generate_blog_post(_kw, _cat)),
-            _run_with_retry(lambda: generate_english_post([], chosen_slot, _cat, keyword=_kw)),
-        )
+        post_data = await _run_with_retry(lambda: generate_blog_post(_kw, _cat))
         post_data["keyword"] = keyword
 
     title = post_data["title"]
@@ -200,18 +198,10 @@ async def run_blog_pipeline(
     content = _inject_summary_box(post_data["content"], summary)
     content = _inject_adsense(content)
 
-    # 영어 포스트 content 구성
-    en_title = en_post_data["title"]
-    en_summary = en_post_data.get("summary", [])
-    en_tags = en_post_data.get("tags", [])
-    en_meta_description = en_post_data.get("meta_description", "")
-    en_content = _inject_summary_box(en_post_data["content"], en_summary)
-    en_content = _inject_adsense(en_content)
-
     # 3. 대표 이미지 생성 — 인라인 삽입 + WordPress Featured Image 설정
     featured_image_id: int | None = None
     try:
-        img_result = await generate_post_image(keyword, title)
+        img_result = await generate_post_image(keyword, title, category)
         if img_result:
             img_bytes, img_mime = img_result
             ext = "jpg" if "jpeg" in img_mime else img_mime.split("/")[-1]
@@ -262,48 +252,6 @@ async def run_blog_pipeline(
         except Exception as e:
             logger.warning("Tracking pixel inject failed: %s", e)
 
-    # 5-2. 영어 포스트 발행
-    en_wp_post_id: int | None = None
-    en_wp_url = ""
-    try:
-        en_wp_result = await _run_with_retry(
-            lambda: publish_post(
-                title=en_title,
-                content=en_content,
-                tags=en_tags,
-                category=category,
-                meta_description=en_meta_description,
-                status=wp_status,
-                featured_image_id=featured_image_id,
-            )
-        )
-        en_wp_post_id = en_wp_result["post_id"]
-        en_wp_url = en_wp_result["url"]
-
-        if api_base:
-            en_tracking_pixel = (
-                f'\n<img src="{api_base}/blog/track/{en_wp_post_id}" '
-                f'width="1" height="1" style="display:none" alt="">'
-            )
-            try:
-                await edit_post(en_wp_post_id, {"post_content": en_content + en_tracking_pixel})
-                logger.info("EN tracking pixel injected — post_id=%d", en_wp_post_id)
-            except Exception as e:
-                logger.warning("EN tracking pixel inject failed: %s", e)
-
-        en_keyword = en_post_data.get("keyword", keyword)
-        save_post_log(
-            keyword=en_keyword,
-            topic=f"{category}_en",
-            title=en_title,
-            wp_post_id=en_wp_post_id,
-            wp_url=en_wp_url,
-            status=en_wp_result["status"],
-        )
-        logger.info("EN post published — post_id=%d url=%s", en_wp_post_id, en_wp_url)
-    except Exception as e:
-        logger.warning("English post pipeline failed (KR post unaffected): %s", e)
-
     # 6. 로그 저장
     mark_keyword_used(keyword, category)
     save_post_log(
@@ -325,9 +273,211 @@ async def run_blog_pipeline(
         "wp_post_id": wp_post_id,
         "wp_url": wp_url,
         "wp_status": wp_result["status"],
-        "en_title": en_title,
-        "en_wp_post_id": en_wp_post_id,
-        "en_wp_url": en_wp_url,
     }
     logger.info("=== Blog pipeline done — post_id=%s ===", wp_post_id)
     return result
+
+
+async def run_en_guide_pipeline(wp_status: str = "publish") -> dict:
+    """19시 영어 How-To 가이드 포스트 파이프라인."""
+    init_db()
+    logger.info("=== EN guide pipeline start ===")
+
+    from services.blog_db import get_recent_posts
+    from services.blog_topic_engine import pick_topic
+    recent = get_recent_posts(limit=30)
+    used_kw = [p["keyword"] for p in recent if p.get("topic", "").endswith("_en")]
+
+    topic_kw, topic_cat = await pick_topic(lang="en", exclude_topics=used_kw)
+
+    post_data = await _run_with_retry(
+        lambda: generate_english_guide_post(
+            used_kw,
+            forced_keyword=topic_kw,
+            forced_category=topic_cat,
+        )
+    )
+    category = post_data.pop("_category", "AI")
+    keyword = post_data["keyword"]
+    title = post_data["title"]
+    summary = post_data.get("summary", [])
+    tags = post_data.get("tags", [])
+    meta_description = post_data.get("meta_description", "")
+
+    content = _inject_summary_box(post_data["content"], summary, lang="en")
+    content = _inject_adsense(content)
+
+    # 이미지
+    featured_image_id: int | None = None
+    try:
+        img_result = await generate_post_image(keyword, title, category)
+        if img_result:
+            img_bytes, img_mime = img_result
+            ext = "jpg" if "jpeg" in img_mime else img_mime.split("/")[-1]
+            filename = f"post-en-{datetime.now(KST).strftime('%Y%m%d%H%M%S')}.{ext}"
+            img_upload = await upload_image(img_bytes, img_mime, filename)
+            raw_id = img_upload.get("id")
+            if raw_id:
+                try:
+                    featured_image_id = int(raw_id)
+                except (ValueError, TypeError):
+                    pass
+    except Exception as e:
+        logger.warning("EN guide image step failed: %s", e)
+
+    # WordPress 발행
+    try:
+        wp_result = await _run_with_retry(
+            lambda: publish_post(
+                title=title,
+                content=content,
+                tags=tags,
+                category=category,
+                meta_description=meta_description,
+                status=wp_status,
+                featured_image_id=featured_image_id,
+            )
+        )
+    except Exception as e:
+        save_post_log(keyword, f"{category}_en", title, status="failed", error_msg=str(e))
+        logger.error("EN guide WordPress publish failed: %s", e)
+        raise
+
+    wp_post_id = wp_result["post_id"]
+    wp_url = wp_result["url"]
+
+    api_base = os.getenv("API_BASE_URL", "").rstrip("/")
+    if api_base:
+        try:
+            tracking_pixel = (
+                f'\n<img src="{api_base}/blog/track/{wp_post_id}" '
+                f'width="1" height="1" style="display:none" alt="">'
+            )
+            await edit_post(wp_post_id, {"post_content": content + tracking_pixel})
+        except Exception as e:
+            logger.warning("EN guide tracking pixel failed: %s", e)
+
+    save_post_log(
+        keyword=keyword, topic=f"{category}_en", title=title,
+        wp_post_id=wp_post_id, wp_url=wp_url, status=wp_result["status"],
+    )
+    logger.info("=== EN guide pipeline done — post_id=%s ===", wp_post_id)
+    return {
+        "slot": "evening",
+        "lang": "en",
+        "category": category,
+        "keyword": keyword,
+        "title": title,
+        "tags": tags,
+        "wp_post_id": wp_post_id,
+        "wp_url": wp_url,
+        "wp_status": wp_result["status"],
+    }
+
+
+async def run_kr_guide_pipeline(slot: str = "morning", wp_status: str = "publish") -> dict:
+    """07시/13시 한국어 검색형 가이드 파이프라인. Topic Engine으로 동적 키워드 선정."""
+    init_db()
+    logger.info("=== KR guide pipeline start — slot=%s ===", slot)
+
+    from services.blog_db import get_recent_posts
+    from services.blog_topic_engine import pick_topic
+    import pytz as _pytz
+    _kst = _pytz.timezone("Asia/Seoul")
+    _today = datetime.now(_kst).strftime("%Y-%m-%d")
+    recent = get_recent_posts(limit=30)
+    used_kw = [p["keyword"] for p in recent if p.get("topic", "") not in ("", None) and "_en" not in p.get("topic", "")]
+    today_cats = {
+        p.get("topic", "") for p in recent
+        if p.get("created_at", "").startswith(_today) and "_en" not in p.get("topic", "")
+    }
+
+    topic_kw, topic_cat = await pick_topic(
+        lang="ko",
+        exclude_topics=used_kw,
+        exclude_categories=today_cats,
+    )
+
+    post_data = await _run_with_retry(
+        lambda: generate_kr_guide_post(
+            used_kw,
+            exclude_categories=today_cats,
+            forced_keyword=topic_kw,
+            forced_category=topic_cat,
+        )
+    )
+    category = post_data.pop("_category", "AI")
+    keyword = post_data["keyword"]
+    title = post_data["title"]
+    summary = post_data.get("summary", [])
+    tags = post_data.get("tags", [])
+    meta_description = post_data.get("meta_description", "")
+
+    content = _inject_summary_box(post_data["content"], summary)
+    content = _inject_adsense(content)
+
+    featured_image_id: int | None = None
+    try:
+        img_result = await generate_post_image(keyword, title, category)
+        if img_result:
+            img_bytes, img_mime = img_result
+            ext = "jpg" if "jpeg" in img_mime else img_mime.split("/")[-1]
+            filename = f"post-kr-{slot}-{datetime.now(KST).strftime('%Y%m%d%H%M%S')}.{ext}"
+            img_upload = await upload_image(img_bytes, img_mime, filename)
+            raw_id = img_upload.get("id")
+            if raw_id:
+                try:
+                    featured_image_id = int(raw_id)
+                except (ValueError, TypeError):
+                    pass
+    except Exception as e:
+        logger.warning("KR guide image step failed: %s", e)
+
+    try:
+        wp_result = await _run_with_retry(
+            lambda: publish_post(
+                title=title,
+                content=content,
+                tags=tags,
+                category=category,
+                meta_description=meta_description,
+                status=wp_status,
+                featured_image_id=featured_image_id,
+            )
+        )
+    except Exception as e:
+        save_post_log(keyword, category, title, status="failed", error_msg=str(e))
+        logger.error("KR guide WordPress publish failed: %s", e)
+        raise
+
+    wp_post_id = wp_result["post_id"]
+    wp_url = wp_result["url"]
+
+    api_base = os.getenv("API_BASE_URL", "").rstrip("/")
+    if api_base:
+        try:
+            tracking_pixel = (
+                f'\n<img src="{api_base}/blog/track/{wp_post_id}" '
+                f'width="1" height="1" style="display:none" alt="">'
+            )
+            await edit_post(wp_post_id, {"post_content": content + tracking_pixel})
+        except Exception as e:
+            logger.warning("KR guide tracking pixel failed: %s", e)
+
+    mark_keyword_used(keyword, category)
+    save_post_log(
+        keyword=keyword, topic=category, title=title,
+        wp_post_id=wp_post_id, wp_url=wp_url, status=wp_result["status"],
+    )
+    logger.info("=== KR guide pipeline done — slot=%s post_id=%s ===", slot, wp_post_id)
+    return {
+        "slot": slot,
+        "lang": "ko",
+        "category": category,
+        "keyword": keyword,
+        "title": title,
+        "tags": tags,
+        "wp_post_id": wp_post_id,
+        "wp_url": wp_url,
+        "wp_status": wp_result["status"],
+    }

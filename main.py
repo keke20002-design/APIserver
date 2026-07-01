@@ -11,6 +11,7 @@ from pathlib import Path
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import pytz
 from dotenv import load_dotenv
+load_dotenv()
 from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
@@ -18,7 +19,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse,
 from services.blog_pipeline import run_blog_pipeline, run_en_guide_pipeline, run_kr_guide_pipeline
 from services.trader_pipeline import run_trader_pipeline
 from services.blog_db import get_recent_posts, get_used_keywords, init_db as init_blog_db
-from services.blog_wordpress_service import update_additional_css, delete_post as wp_delete_post, edit_post as wp_edit_post, setup_branding as wp_setup_branding, setup_nav_menu as wp_setup_nav_menu
+from services.blog_wordpress_service import update_additional_css, delete_post as wp_delete_post, edit_post as wp_edit_post, setup_branding as wp_setup_branding, setup_nav_menu as wp_setup_nav_menu, inject_cat_pagination_fix as wp_inject_cat_pagination_fix, patch_all_posts_pagination as wp_patch_all_posts_pagination
 from services.analyzer import analyze
 from services.kbo_schedule import fetch_kbo_schedule
 from services.stadium_updater import run_collection
@@ -60,8 +61,6 @@ from services.worldcup_schedule import (
 )
 from services.worldcup_insight import generate_worldcup_match_insight, generate_worldcup_win_prediction
 from utils.cache import cache
-
-load_dotenv()
 
 # 성경 구절 데이터 (서버 시작 시 1회 로드)
 _BIBLE_DATA: list[dict] = []
@@ -834,7 +833,7 @@ async def get_videos(away_team: str, home_team: str, date: str, status: str = ""
         videos = await search_kbo_videos(away_team, home_team, date, status=status)
     except Exception as e:
         logger.error("YouTube search failed: %s", e)
-        raise HTTPException(status_code=502, detail="YouTube search failed")
+        return {"videos": []}
     result = {"videos": videos}
     cache.set(cache_key, result, ttl=3600)  # 1시간 캐시
     return result
@@ -2728,6 +2727,34 @@ article.sticky {
     background: #eff6ff !important;
 }
 
+/* ─ mark 강조 태그 가독성 ─ */
+mark {
+    background: none !important;
+    color: #1d4ed8 !important;
+    font-weight: 700 !important;
+    border-bottom: 2px solid #93c5fd !important;
+    padding: 0 !important;
+    border-radius: 0 !important;
+}
+.conclusion-box mark {
+    background: none !important;
+    color: #fef08a !important;
+    border-bottom: none !important;
+}
+.conclusion-box h2,
+.conclusion-box h3 {
+    color: #bfdbfe !important;
+    border: none !important;
+    border-bottom: none !important;
+    padding-left: 0 !important;
+    margin-top: 0 !important;
+}
+.conclusion-box a,
+.conclusion-box p a {
+    color: #bfdbfe !important;
+    border-bottom: 1px solid rgba(191,219,254,0.4) !important;
+}
+
 /* ─ 작성자·카테고리 메타 숨김 (Written by / in Category) ─ */
 .entry-meta,
 .byline,
@@ -2741,6 +2768,7 @@ span.author,
 .entry-footer .cat-links,
 .entry-footer .tags-links,
 .post-author,
+.post-meta,
 .wp-block-post-author,
 [class*="author"],
 [class*="byline"],
@@ -2763,6 +2791,30 @@ async def blog_apply_theme_css():
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@app.post("/blog/admin/fix-cat-pagination")
+async def blog_fix_cat_pagination():
+    """카테고리 포스트 위젯 페이지네이션 상태 유지 JS를 WordPress에 주입."""
+    try:
+        result = await wp_inject_cat_pagination_fix()
+        return {"message": "페이지네이션 JS 주입 완료", **result}
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.error("Cat pagination fix failed: %s", e)
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/blog/admin/patch-posts-pagination")
+async def blog_patch_posts_pagination():
+    """기존 WordPress 포스트 전체에 카테고리 페이지네이션 JS 패치."""
+    try:
+        result = await wp_patch_all_posts_pagination()
+        return {"message": "패치 완료", **result}
+    except Exception as e:
+        logger.error("Patch posts pagination failed: %s", e)
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 # ── YouTube AI Copilot ───────────────────────────────────────────────────────
 
 from services.ytcopilot_service import (
@@ -2774,6 +2826,7 @@ from services.ytcopilot_service import (
     generate_tags as ytc_tags,
     generate_thumbnail_text as ytc_thumbnail,
     generate_script as ytc_script,
+    optimize_video as ytc_optimize,
 )
 
 
@@ -2815,4 +2868,32 @@ async def ytcopilot_generate(body: dict = Body(...)):
         raise
     except Exception as e:
         logger.error("ytcopilot generate error [%s]: %s", gen_type, e)
+        raise HTTPException(500, str(e))
+
+
+@app.post("/ytcopilot/optimize")
+async def ytcopilot_optimize(body: dict = Body(...)):
+    device_id = (body.get("device_id") or "").strip()
+    topic = (body.get("topic") or "").strip()
+    current_title = (body.get("current_title") or "").strip()
+    target = (body.get("target") or "").strip()
+    style = (body.get("style") or "").strip()
+
+    if not device_id:
+        raise HTTPException(400, "device_id is required")
+    if not topic:
+        raise HTTPException(400, "topic is required")
+    if not ytc_can_generate(device_id):
+        raise HTTPException(429, "오늘 무료 생성 횟수(5회)를 모두 사용했습니다.")
+
+    try:
+        result = await ytc_optimize(topic, current_title, target, style)
+        ytc_increment_usage(device_id)
+        return {"result": result, "usage": ytc_get_usage(device_id)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ytcopilot optimize error: %s", e)
         raise HTTPException(500, str(e))

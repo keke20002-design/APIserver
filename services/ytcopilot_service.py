@@ -1,5 +1,7 @@
+import json as _json
 import logging
 import os
+import re as _re
 from datetime import date
 
 from google import genai
@@ -124,6 +126,72 @@ async def generate_thumbnail_text(topic: str) -> str:
 JSON 배열로만 응답:
 ["텍스트1", "텍스트2", ..., "텍스트10"]"""
     return await _generate(prompt, 0.9)
+
+
+def _extract_video_id(url: str) -> str:
+    m = _re.search(r'[?&]v=([a-zA-Z0-9_-]{11})', url)
+    if m:
+        return m.group(1)
+    m = _re.search(r'youtu\.be/([a-zA-Z0-9_-]{11})', url)
+    if m:
+        return m.group(1)
+    raise ValueError(f"유효한 YouTube URL이 아닙니다: {url}")
+
+
+async def _generate_with_youtube(youtube_url: str, prompt: str, temperature: float = 0.85) -> str:
+    client = _client()
+    response = await client.aio.models.generate_content(
+        model=_MODEL,
+        contents=[
+            types.Part(
+                file_data=types.FileData(
+                    mime_type="video/mp4",
+                    file_uri=youtube_url,
+                )
+            ),
+            types.Part(text=prompt),
+        ],
+        config=types.GenerateContentConfig(temperature=temperature),
+    )
+    return response.text
+
+
+async def optimize_video(topic: str, current_title: str, target: str, style: str) -> dict:
+    prompt = f"""당신은 한국 유튜브 최적화 전문가입니다.
+
+영상 정보:
+- 주제: {topic}
+- 현재 제목: {current_title}
+- 타겟 시청자: {target}
+- 영상 스타일: {style}
+
+위 정보를 바탕으로 유튜브 업로드 최적화 결과를 아래 JSON 형식으로만 응답하세요.
+순수 JSON만 응답하세요 (마크다운 코드블록, 설명 텍스트 없이):
+
+{{
+  "ctr_score": 72,
+  "seo_score": 65,
+  "titles": ["제목1", ..., "제목5"],
+  "thumbnail_texts": ["문구1", ..., "문구5"],
+  "description": "설명란 전문",
+  "tags": ["태그1", ..., "태그15"],
+  "pinned_comment": "고정 댓글 내용"
+}}
+
+조건:
+- ctr_score: 현재 제목의 CTR 예상 점수 0~100 (숫자만)
+- seo_score: 현재 제목의 SEO 점수 0~100 (숫자만)
+- titles: 타겟/스타일에 맞는 클릭 유도 제목 5개, 한국어 15-35자, 숫자·감정어·트렌드 활용
+- thumbnail_texts: 썸네일에 넣을 2-8글자 임팩트 문구 5개
+- description: 200-300자, 첫 2줄 핵심요약, 해시태그 3-5개 포함
+- tags: 한국어+영어 혼합 검색 최적화 태그 15개
+- pinned_comment: 시청자 참여 유도 고정댓글 1개 (구어체, 질문형)"""
+
+    raw = await _generate(prompt, temperature=0.8)
+    match = _re.search(r'\{[\s\S]*\}', raw)
+    if not match:
+        raise ValueError("AI 응답에서 JSON을 파싱할 수 없습니다.")
+    return _json.loads(match.group())
 
 
 async def generate_script(topic: str, duration: int = 60) -> str:

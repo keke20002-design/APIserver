@@ -1,5 +1,6 @@
 """WordPress XML-RPC 기반 블로그 발행 서비스."""
 import asyncio
+import base64
 import logging
 import os
 import xmlrpc.client
@@ -243,3 +244,78 @@ async def setup_branding(title: str, tagline: str, category_map: dict) -> dict:
     loop = asyncio.get_event_loop()
     fn = partial(_sync_setup_branding, title, tagline, category_map)
     return await loop.run_in_executor(_executor, fn)
+
+
+def _get_rest_headers() -> tuple[str, dict]:
+    """WP REST API base URL + Basic Auth 헤더 반환."""
+    internal_url = os.getenv("WORDPRESS_INTERNAL_URL", "").rstrip("/")
+    public_url = os.getenv("WORDPRESS_URL", "").rstrip("/")
+    base_url = internal_url or public_url
+    username = os.getenv("WORDPRESS_USERNAME", "")
+    password = os.getenv("WORDPRESS_APP_PASSWORD", "")
+    token = base64.b64encode(f"{username}:{password}".encode()).decode()
+    headers = {
+        "Authorization": f"Basic {token}",
+        "Content-Type": "application/json",
+    }
+    return base_url, headers
+
+
+async def setup_nav_menu(menu_items: list[dict]) -> dict:
+    """
+    WordPress REST API로 네비게이션 메뉴를 영어로 교체.
+    menu_items: [{"title": "AI", "url": "/category/ai-tech/"}, ...]
+    기존 'Primary Menu' 메뉴를 찾아 항목을 교체. 없으면 새로 생성.
+    """
+    import httpx
+
+    base_url, headers = _get_rest_headers()
+    # XML-RPC는 내부 URL이지만 REST API는 외부 public URL 경유
+    public_url = os.getenv("WORDPRESS_URL", "").rstrip("/")
+    api = f"{public_url}/wp-json/wp/v2"
+
+    async with httpx.AsyncClient(timeout=20, headers=headers) as client:
+        # 1. 기존 메뉴 목록 조회
+        r = await client.get(f"{api}/menus")
+        r.raise_for_status()
+        menus = r.json()
+
+        # Primary Menu 또는 첫 번째 메뉴 선택
+        menu_id = None
+        for m in menus:
+            if "primary" in m.get("slug", "").lower() or "main" in m.get("slug", "").lower():
+                menu_id = m["id"]
+                break
+        if menu_id is None and menus:
+            menu_id = menus[0]["id"]
+
+        # 메뉴가 없으면 새로 생성
+        if menu_id is None:
+            r = await client.post(f"{api}/menus", json={"name": "Primary Menu", "slug": "primary"})
+            r.raise_for_status()
+            menu_id = r.json()["id"]
+            logger.info("Created new menu id=%d", menu_id)
+
+        # 2. 기존 메뉴 항목 삭제
+        r = await client.get(f"{api}/menu-items", params={"menus": menu_id, "per_page": 100})
+        r.raise_for_status()
+        existing_items = r.json()
+        for item in existing_items:
+            await client.delete(f"{api}/menu-items/{item['id']}", params={"force": True})
+
+        # 3. 새 메뉴 항목 추가
+        created = []
+        for order, item in enumerate(menu_items, start=1):
+            payload = {
+                "title": item["title"],
+                "url": item.get("url", "/"),
+                "status": "publish",
+                "menus": menu_id,
+                "menu_order": order,
+            }
+            r = await client.post(f"{api}/menu-items", json=payload)
+            r.raise_for_status()
+            created.append(r.json().get("title", {}).get("rendered", item["title"]))
+
+        logger.info("Nav menu updated — menu_id=%d items=%s", menu_id, created)
+        return {"menu_id": menu_id, "items": created}

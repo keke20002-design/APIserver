@@ -53,30 +53,49 @@ KEYWORD_CATEGORY: dict[str, str] = {
 }
 
 
-# ── 점수 계산 함수들 ──────────────────────────────────────────────────────────
+# ── plan.md 점수 체계: 검색가능성40 / 돈수익30 / AI자동화20 / 장기가치10 ────
 
-def _article_score(count: int, max_count: int) -> float:
-    """기사량 점수 0~100 (정규화)."""
-    return (count / max_count * 100) if max_count > 0 else 0
-
-
-def _intent_score(items: list[dict]) -> float:
-    """검색 의도 점수: 뉴스 제목 중 분석성 키워드 포함 비율."""
-    if not items:
-        return 0
-    matched = sum(
-        1 for item in items
-        if any(w in item.get("title", "") for w in _INTENT_WORDS)
-    )
-    return matched / len(items) * 100
+_PRIORITY_KEYWORDS = [
+    "ChatGPT", "Claude", "Claude Code", "Gemini", "Cursor",
+    "MCP", "AI Agent", "OpenAI", "Gemini API", "AI 자동화",
+    "엔비디아", "AI 관련주", "비트코인", "ETF", "미국주식",
+]
+_MONEY_HIGH = ["비트코인", "ETF", "미국주식", "엔비디아", "AI 관련주", "반도체", "주식", "투자", "수익"]
+_MONEY_MID  = ["ChatGPT", "Gemini", "Claude", "OpenAI", "API", "비용", "가격"]
+_AI_HIGH    = ["Claude Code", "MCP", "AI Agent", "AI 자동화", "Cursor"]
+_AI_MID     = ["ChatGPT", "Gemini", "Claude", "OpenAI", "Gemini API", "AI"]
+_EVERGREEN  = ["사용법", "방법", "비교", "차이", "비용", "전망", "가이드", "입문", "정리", "해보니"]
 
 
-def _profitability_score(query: str) -> float:
-    """수익성 점수: S=100 / A=60 / B=20."""
-    for kw, grade in KEYWORD_GRADE.items():
-        if kw in query:
-            return _GRADE_SCORE[grade]
+def _searchability_score(query: str, items: list[dict]) -> float:
+    """검색 가능성 (40점): 기사량 + 우선순위 키워드 여부."""
+    base = len(items) / 20 * 60
+    if any(kw in query for kw in _PRIORITY_KEYWORDS):
+        base += 40
+    return min(100, base)
+
+
+def _money_score(query: str) -> float:
+    """돈/수익 관련성 (30점)."""
+    if any(kw in query for kw in _MONEY_HIGH):
+        return 100
+    if any(kw in query for kw in _MONEY_MID):
+        return 60
     return 20
+
+
+def _ai_score(query: str) -> float:
+    """AI/자동화 관련성 (20점)."""
+    if any(kw in query for kw in _AI_HIGH):
+        return 100
+    if any(kw in query for kw in _AI_MID):
+        return 80
+    return 20
+
+
+def _longtail_score(query: str) -> float:
+    """장기 검색 가치 (10점): 에버그린 키워드 여부."""
+    return 100 if any(kw in query for kw in _EVERGREEN) else 50
 
 
 def _count_today_yesterday(items: list[dict]) -> tuple[int, int]:
@@ -114,6 +133,23 @@ def _has_recent_duplicate(query: str, recent_kws: set[str]) -> bool:
 
 
 _GUIDES_SUFFIXES = ("사용법", "활용법", "방법", "튜토리얼", "비교", "가이드")
+
+# plan.md 절대 생성 금지 — 뉴스 제목에 이 패턴이 많으면 해당 후보 제외
+_BANNED_TITLE_PATTERNS = (
+    "오늘의 AI 뉴스", "AI 뉴스 모음", "AI 업계 소식",
+    "오늘의 경제 뉴스", "뉴스 브리핑", "일일 요약",
+    "뉴스레터", "주간 뉴스", "이번 주 뉴스",
+)
+
+def _is_banned_topic(items: list[dict]) -> bool:
+    """뉴스 제목 다수가 금지 패턴이면 True (기사량 기반 포스팅 차단)."""
+    if not items:
+        return False
+    banned = sum(
+        1 for item in items
+        if any(p in item.get("title", "") for p in _BANNED_TITLE_PATTERNS)
+    )
+    return banned / len(items) > 0.5
 
 
 def _detect_category(query: str) -> str:
@@ -159,22 +195,25 @@ async def collect_hot_news(slot: str) -> Optional[dict]:
 
     scored = []
     for query, items in news_map.items():
-        article_s    = _article_score(len(items), max_count)
-        intent_s     = _intent_score(items)
-        profit_s     = _profitability_score(query)
-        today_cnt, yesterday_cnt = _count_today_yesterday(items)
-        fresh_s      = _freshness_score(today_cnt, yesterday_cnt)
+        search_s  = _searchability_score(query, items)
+        money_s   = _money_score(query)
+        ai_s      = _ai_score(query)
+        long_s    = _longtail_score(query)
 
         final = (
-            article_s * 0.4
-            + intent_s * 0.3
-            + profit_s * 0.2
-            + fresh_s  * 0.1
+            search_s * 0.4
+            + money_s  * 0.3
+            + ai_s     * 0.2
+            + long_s   * 0.1
         )
 
         duplicate = _has_recent_duplicate(query, recent_kws)
         if duplicate:
             final *= 0.7
+
+        banned = _is_banned_topic(items)
+        if banned:
+            final = 0
 
         scored.append({
             "query":    query,
@@ -182,12 +221,13 @@ async def collect_hot_news(slot: str) -> Optional[dict]:
             "news":     items[:8],
             "coverage": len(items),
             "scores": {
-                "article":           round(article_s, 1),
-                "intent":            round(intent_s, 1),
-                "profit":            round(profit_s, 1),
-                "freshness":         round(fresh_s, 1),
-                "final":             round(final, 1),
+                "searchability": round(search_s, 1),
+                "money":         round(money_s, 1),
+                "ai":            round(ai_s, 1),
+                "longtail":      round(long_s, 1),
+                "final":         round(final, 1),
                 "duplicate_penalty": duplicate,
+                "banned":        banned,
             },
         })
 
@@ -196,22 +236,18 @@ async def collect_hot_news(slot: str) -> Optional[dict]:
 
     logger.info(
         "Topic selected — slot=%s query='%s' score=%.1f "
-        "[art=%.1f int=%.1f pro=%.1f fresh=%.1f dup=%s] "
-        "today=%d yesterday=%d",
+        "[search=%.1f money=%.1f ai=%.1f long=%.1f dup=%s]",
         slot, best["query"], best["scores"]["final"],
-        best["scores"]["article"], best["scores"]["intent"],
-        best["scores"]["profit"], best["scores"]["freshness"],
+        best["scores"]["searchability"], best["scores"]["money"],
+        best["scores"]["ai"], best["scores"]["longtail"],
         best["scores"]["duplicate_penalty"],
-        *_count_today_yesterday(best["news"]),
     )
-
-    # 상위 3개 후보도 로그에 기록
     for rank, c in enumerate(scored[1:4], 2):
         logger.debug(
-            "  #%d '%s' score=%.1f [art=%.1f int=%.1f pro=%.1f fresh=%.1f dup=%s]",
+            "  #%d '%s' score=%.1f [search=%.1f money=%.1f ai=%.1f long=%.1f dup=%s]",
             rank, c["query"], c["scores"]["final"],
-            c["scores"]["article"], c["scores"]["intent"],
-            c["scores"]["profit"], c["scores"]["freshness"],
+            c["scores"]["searchability"], c["scores"]["money"],
+            c["scores"]["ai"], c["scores"]["longtail"],
             c["scores"]["duplicate_penalty"],
         )
 
@@ -220,9 +256,18 @@ async def collect_hot_news(slot: str) -> Optional[dict]:
 
 # ── 폴백: 뉴스 없을 때 키워드 직접 선택 ─────────────────────────────────────
 FALLBACK_SEEDS: dict[str, list[str]] = {
-    "morning":   ["ChatGPT 사용법", "엔비디아 주가 전망", "AI Agent 활용"],
-    "afternoon": ["Claude Code 사용법", "ETF 투자 방법", "비트코인 전망", "AI 자동화 사례"],
-    "evening":   ["Gemini 사용법", "반도체 주가 전망", "MCP 활용법"],
+    "morning": [
+        "Claude Code 자동화 방법", "ChatGPT 유료 무료 차이", "Gemini API 비용 정리",
+        "MCP 서버 구축 방법", "AI Agent 만드는 방법", "Cursor 사용해보니",
+    ],
+    "afternoon": [
+        "OpenAI API 사용 방법", "Claude Code vs Cursor 차이", "엔비디아 주가 전망",
+        "비트코인 ETF 영향", "미국주식 AI 관련주", "ETF 투자 방법",
+    ],
+    "evening": [
+        "Gemini 2.5 Flash 써보니", "ChatGPT 최신 기능 정리", "AI 자동화 사례",
+        "반도체 주가 전망", "Claude 사용 비용 정리", "AI 수혜주 전망",
+    ],
 }
 
 

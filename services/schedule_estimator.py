@@ -2,6 +2,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 from services.kbo_schedule import fetch_kbo_schedule
+from utils.cache import cache
 
 logger = logging.getLogger(__name__)
 
@@ -17,11 +18,15 @@ async def estimate_parking_status(stadium: str) -> dict:
     - Game exists, off-peak      → normal
     - Within 2h before ~ 1h after game start → bad
     """
-    try:
-        games = await fetch_kbo_schedule()
-    except Exception as e:
-        logger.error("Schedule fetch failed for '%s': %s", stadium, e)
-        return _result(stadium, "unknown", [], estimated=True)
+    cached = cache.get("games:today")
+    if cached:
+        games = cached.get("games", [])
+    else:
+        try:
+            games = await fetch_kbo_schedule()
+        except Exception as e:
+            logger.error("Schedule fetch failed for '%s': %s", stadium, e)
+            return _result(stadium, "unknown", [], estimated=True)
 
     stadium_games = [g for g in games if stadium in g.get("stadium", "")]
 
@@ -29,7 +34,7 @@ async def estimate_parking_status(stadium: str) -> dict:
         return _result(stadium, "good", [], estimated=True)
 
     now = datetime.now(KST)
-    status = "normal"
+    status = "good"
 
     for game in stadium_games:
         game_time_str = game.get("time", "")
